@@ -303,6 +303,8 @@ BenchmarkParams BenchmarkTfLiteModel::DefaultParams() {
                           BenchmarkParam::Create<bool>(false));
   default_params.AddParam("use_dynamic_tensors_for_large_tensors",
                           BenchmarkParam::Create<int32_t>(0));
+  default_params.AddParam(
+      "output_file", BenchmarkParam::Create<std::string>("outputs/output"));
 
   tools::ProvidedDelegateList delegate_providers(&default_params);
   delegate_providers.AddAllDelegateParams();
@@ -336,6 +338,7 @@ std::vector<Flag> BenchmarkTfLiteModel::GetFlags() {
       CreateFlag<std::string>("input_layer", &params_, "input layer names"),
       CreateFlag<std::string>("input_layer_shape", &params_,
                               "input layer shape"),
+      CreateFlag<std::string>("output_file", &params_, "output file prefix"),
       CreateFlag<std::string>(
           "input_layer_value_range", &params_,
           "A map-like string representing value range for *integer* input "
@@ -400,7 +403,8 @@ void BenchmarkTfLiteModel::LogParams() {
                       "Input value ranges", verbose);
   LOG_BENCHMARK_PARAM(std::string, "input_layer_value_files",
                       "Input value files", verbose);
-
+  LOG_BENCHMARK_PARAM(std::string, "output_file", "Output file prefix",
+                      verbose);
   LOG_BENCHMARK_PARAM(bool, "allow_fp16", "Allow fp16", verbose);
   LOG_BENCHMARK_PARAM(bool, "require_full_delegation",
                       "Require full delegation", verbose);
@@ -793,7 +797,30 @@ BenchmarkTfLiteModel::MayCreateProfilingListener() const {
           !params_.Get<std::string>("profiling_output_csv_file").empty())));
 }
 
-TfLiteStatus BenchmarkTfLiteModel::RunImpl() { return interpreter_->Invoke(); }
+TfLiteStatus BenchmarkTfLiteModel::RunImpl() {
+  auto status = interpreter_->Invoke();
+
+  if (status != kTfLiteOk) {
+    return status;
+  }
+
+  auto interpreterOutputs = interpreter_->outputs();
+
+  for (int i = 0; i < interpreterOutputs.size(); ++i) {
+    const TfLiteTensor& t = *(interpreter_->tensor(interpreterOutputs[i]));
+    TFLITE_LOG(INFO) << params_.Get<std::string>("output_file");
+    std::ofstream out(params_.Get<std::string>("output_file") + "_" +
+                      std::to_string(i) + ".bytes");
+    if (!out) {
+      TFLITE_LOG(ERROR) << "Cannot open output file";
+    } else {
+      out.write((char*)interpreter_->typed_output_tensor<float>(i), t.bytes);
+      out.close();
+    }
+  }
+
+  return kTfLiteOk;
+}
 
 }  // namespace benchmark
 }  // namespace tflite
