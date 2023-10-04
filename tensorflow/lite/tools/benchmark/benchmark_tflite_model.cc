@@ -303,8 +303,8 @@ BenchmarkParams BenchmarkTfLiteModel::DefaultParams() {
                           BenchmarkParam::Create<bool>(false));
   default_params.AddParam("use_dynamic_tensors_for_large_tensors",
                           BenchmarkParam::Create<int32_t>(0));
-  default_params.AddParam(
-      "output_file", BenchmarkParam::Create<std::string>("outputs/output"));
+  default_params.AddParam("output_file_prefix",
+                          BenchmarkParam::Create<std::string>("output/output"));
 
   tools::ProvidedDelegateList delegate_providers(&default_params);
   delegate_providers.AddAllDelegateParams();
@@ -338,7 +338,8 @@ std::vector<Flag> BenchmarkTfLiteModel::GetFlags() {
       CreateFlag<std::string>("input_layer", &params_, "input layer names"),
       CreateFlag<std::string>("input_layer_shape", &params_,
                               "input layer shape"),
-      CreateFlag<std::string>("output_file", &params_, "output file prefix"),
+      CreateFlag<std::string>("output_file_prefix", &params_,
+                              "output file prefix"),
       CreateFlag<std::string>(
           "input_layer_value_range", &params_,
           "A map-like string representing value range for *integer* input "
@@ -403,7 +404,7 @@ void BenchmarkTfLiteModel::LogParams() {
                       "Input value ranges", verbose);
   LOG_BENCHMARK_PARAM(std::string, "input_layer_value_files",
                       "Input value files", verbose);
-  LOG_BENCHMARK_PARAM(std::string, "output_file", "Output file prefix",
+  LOG_BENCHMARK_PARAM(std::string, "output_file_prefix", "Output file prefix",
                       verbose);
   LOG_BENCHMARK_PARAM(bool, "allow_fp16", "Allow fp16", verbose);
   LOG_BENCHMARK_PARAM(bool, "require_full_delegation",
@@ -808,14 +809,108 @@ TfLiteStatus BenchmarkTfLiteModel::RunImpl() {
 
   for (int i = 0; i < interpreterOutputs.size(); ++i) {
     const TfLiteTensor& t = *(interpreter_->tensor(interpreterOutputs[i]));
-    TFLITE_LOG(INFO) << params_.Get<std::string>("output_file");
-    std::ofstream out(params_.Get<std::string>("output_file") + "_" +
-                      std::to_string(i) + ".bytes");
+    std::string path = params_.Get<std::string>("output_file_prefix") + "_" +
+                       std::to_string(i) + ".bytes";
+    std::ofstream out(path.c_str());
     if (!out) {
       TFLITE_LOG(ERROR) << "Cannot open output file";
     } else {
+      TFLITE_LOG(INFO) << "Writing model output " << i << " to path: " << path;
       out.write((char*)interpreter_->typed_output_tensor<float>(i), t.bytes);
       out.close();
+
+      if (i > 0) {
+        continue;
+      }
+
+      std::string shape_str = params_.Get<std::string>("input_layer_shape");
+      std::vector<std::string> input_shape = Split(shape_str, ',');
+      int H = std::ceil(std::stoi(input_shape[1]) / 8.0);
+      int W = std::ceil(std::stoi(input_shape[2]) / 8.0);
+      const int C = 19;
+
+      std::string channelNames[C] = {
+          "nose",  "chest", "r_sho", "r_elb", "r_wri", "l_sho", "l_elb",
+          "l_wri", "r_hip", "r_kne", "r_ank", "l_hip", "l_kne", "l_ank",
+          "r_eye", "l_eye", "r_ear", "l_ear", "None"};
+
+      std::map<int, float> lessThanChecks = {
+          {9, 0.4}, {10, 0.2}, {12, 0.4}, {13, 0.2}};
+      std::map<int, float> greaterThanChecks = {
+          {0, 0.5}, {1, 0.5}, {15, 0.5}, {14, 0.5}};
+
+      float* heatmapOutput =
+          (float*)interpreter_->typed_output_tensor<float>(i);
+
+      bool lessThanFailed = false;
+      for (std::map<int, float>::iterator it = lessThanChecks.begin();
+           it != lessThanChecks.end(); ++it) {
+        int c = it->first;
+        float maxHeatmapValue = -1;
+        for (int h = 0; h < H; h++) {
+          for (int w = 0; w < W; w++) {
+            int idx = h * W * C + w * C + c;
+            if (heatmapOutput[idx] > maxHeatmapValue) {
+              maxHeatmapValue = heatmapOutput[idx];
+            }
+          }
+        }
+        if (maxHeatmapValue > it->second) {
+          lessThanFailed = true;
+        }
+      }
+
+      if (lessThanFailed) {
+        TFLITE_LOG(INFO) << "\n\nFAILED -- Some output values were "
+                            "consistently too large.\n\n";
+      }
+
+      bool greaterThanFailed = false;
+      for (std::map<int, float>::iterator it = greaterThanChecks.begin();
+           it != greaterThanChecks.end(); ++it) {
+        int c = it->first;
+        float maxHeatmapValue = -1;
+        for (int h = 0; h < H; h++) {
+          for (int w = 0; w < W; w++) {
+            int idx = h * W * C + w * C + c;
+            if (heatmapOutput[idx] > maxHeatmapValue) {
+              maxHeatmapValue = heatmapOutput[idx];
+            }
+          }
+        }
+        if (maxHeatmapValue < it->second) {
+          greaterThanFailed = true;
+        }
+      }
+
+      if (greaterThanFailed) {
+        TFLITE_LOG(INFO) << "\n\nFAILED -- Some output values were "
+                            "consistently too small (close or equal to 0).\n\n";
+      }
+
+      if (!lessThanFailed && !greaterThanFailed) {
+        TFLITE_LOG(INFO) << "\n\nSUCCESS -- Model output is valid.\n\n";
+      } else {
+        float maxHeatmapValue = -1;
+
+        for (int c = 0; c < C; c++) {
+          for (int h = 0; h < H; h++) {
+            for (int w = 0; w < W; w++) {
+              int idx = h * W * C + w * C + c;
+              if (heatmapOutput[idx] > maxHeatmapValue) {
+                maxHeatmapValue = heatmapOutput[idx];
+              }
+            }
+          }
+        }
+
+        if (maxHeatmapValue == 0) {
+          TFLITE_LOG(INFO)
+              << "FAILED -- Max value in every ouput channel is 0.";
+        } else {
+          TFLITE_LOG(INFO) << "MHV: " << maxHeatmapValue;
+        }
+      }
     }
   }
 
